@@ -1,20 +1,32 @@
 {
   "name": "@pipeworx/mcp-clinicaltrials",
-  "version": "0.1.0",
-  "description": "ClinicalTrials MCP — wraps ClinicalTrials.gov API v2 (free, no auth)",
+  "version": "0.1.1",
+  "description": "Search and analyze ClinicalTrials.gov: trials by keyword/condition/drug/status/phase, one study's full design and results, counts by condition, trials by location, and recently updated trials, plus a sponsor-analytics suite (a sponsor's trials, pipeline, and activity, and head-to-head sponsor comparison), catalyst calendars, competitive-landscape summaries, enrollment-watch, results summaries, and phase-transition rates.",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "bin": {
+    "mcp-clinicaltrials": "bin/cli.js"
+  },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "clinicaltrials"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pipeworx-io/mcp-clinicaltrials"
+    "url": "git+https://github.com/pipeworx-io/mcp-clinicaltrials.git"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-72883257001f18544b1e55ec0dff04a73f69212598731255170ffc806c7ef543",
+    "sourceCommit": "60f04b68c347e970c6be94a53439d1364061fc06"
   }
 }

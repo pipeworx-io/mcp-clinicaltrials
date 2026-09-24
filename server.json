@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/clinicaltrials",
-  "title": "clinicaltrials",
-  "description": "ClinicalTrials MCP — wraps ClinicalTrials.gov API v2 (free, no auth)",
-  "version": "0.1.0",
+  "title": "Clinicaltrials",
+  "description": "Search and analyze ClinicalTrials.gov: trials by keyword/condition/drug/status/phase, one study's…",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/clinicaltrials",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-clinicaltrials",
