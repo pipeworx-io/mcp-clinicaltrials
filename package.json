@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-clinicaltrials",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Search and analyze ClinicalTrials.gov: trials by keyword/condition/drug/status/phase, one study's full design and results, counts by condition, trials by location, and recently updated trials, plus a sponsor-analytics suite (a sponsor's trials, pipeline, and activity, and head-to-head sponsor comparison), catalyst calendars, competitive-landscape summaries, enrollment-watch, results summaries, and phase-transition rates.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-1c8c15517ce4ef52666fe3a40ff8a5742f98cba4c7157dc18c42878fdc742c87",
-    "sourceCommit": "bc59503bb19d6bc0b88a827a7dfcfb0a1af4799c"
+    "sourceHash": "v1-ffdf057dbb24a693487c04b5b9e39ce984dfc304a306359d44b6708bfa0d48a3",
+    "sourceCommit": "eaa02971997fbfee27712ea66d7d5fd840d008ea"
   }
 }

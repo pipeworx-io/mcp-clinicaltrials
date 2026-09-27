@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/clinicaltrials",
   "title": "Clinicaltrials",
   "description": "Search and analyze ClinicalTrials.gov: trials by keyword/condition/drug/status/phase, one study's…",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "websiteUrl": "https://pipeworx.io/packs/clinicaltrials",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-clinicaltrials",
