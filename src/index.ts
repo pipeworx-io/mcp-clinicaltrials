@@ -780,7 +780,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'ct_search',
     description:
-      'Search ClinicalTrials.gov for clinical trials — find trials and look up a NAMED trial by keyword, condition, drug/therapy, status (e.g. \'Recruiting\'), or phase (e.g. \'Phase 2\'). Use for "clinical trials for <disease/drug>", or to locate a specific study like "the FLOW trial", "semaglutide kidney outcomes trial" (use ct_get_study for its full design/results). Returns NCT IDs, titles, status, enrollment, and sponsor info.',
+      'Search ClinicalTrials.gov for clinical trials — find trials and look up a NAMED trial by keyword, condition, drug/therapy, status (e.g. \'Recruiting\'), or phase (e.g. \'Phase 2\'). Use for "clinical trials for <disease/drug>", or to locate a specific study like "the FLOW trial", "semaglutide kidney outcomes trial" (use ct_get_study for its full design/results). Returns NCT IDs, titles, status, enrollment, and sponsor info for the current page, PLUS conditions_summary — a condition-by-condition breakdown across ALL matches (not just this page), so "how many trials and what conditions do they cover" is answerable from one call. To see studies past the first page, call again with the SAME query/status/phase/sponsor and page_token set to the previous response\'s next_page_token.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -806,6 +806,11 @@ const tools: McpToolExport['tools'] = [
         limit: {
           type: 'number',
           description: 'Number of results (1-100, default 10)',
+        },
+        page_token: {
+          type: 'string',
+          description:
+            'Pass the previous call\'s `next_page_token` here, with the SAME query/status/phase/sponsor arguments, to fetch studies past the first page. Omit it for a fresh search. A "continue listing"/"next page" follow-up means: re-call with this set, not a new query.',
         },
       },
       required: ['query'],
@@ -1325,6 +1330,96 @@ function buildFilters(status?: string, phase?: string): { params: string[]; clau
 
 /* ── Tool implementations ──────────────────────────────────────────── */
 
+// fleet #3173: "what conditions do they cover" was unanswerable past page 1,
+// and nothing in the response or schema let a caller (or ask_pipeworx's
+// router) reach page 2 at all — a "continue listing" rephrase re-ran the same
+// search and got the same first page back, every time, until the model ran
+// out of rounds. Two independent fixes, both below:
+//
+//   (1) conditions_summary: a condition-by-condition tally over the FULL
+//       match set, not just the returned page, computed via ClinicalTrials.gov's
+//       own pageSize=1000 + nextPageToken cursor (the same mechanism
+//       ptrsFetchTrials already uses above for phase-transition sweeps). When
+//       the requested page already holds every match (total_count <= pageSize)
+//       this costs nothing extra; otherwise it's ONE additional lean call
+//       (NCTId + conditions only, no full study bodies) for anything up to
+//       1,000 matches, which covers the overwhelming majority of real
+//       questions in a single round trip. Genuine parallel fetching isn't
+//       available here: nextPageToken is an opaque cursor only known after
+//       the previous page's response, not an address you can compute ahead of
+//       time — so beyond the cap this says coverage:'partial' and names how
+//       much it actually covered, rather than quietly presenting a sample as
+//       the whole picture.
+//   (2) page_token: the raw nextPageToken passed straight through as an
+//       ordinary tool argument, so a follow-up call is just another ct_search
+//       invocation with one more field set — exactly the mechanism a
+//       tool-calling model already uses for query/status/phase/limit, instead
+//       of a routing concept nothing could reach.
+const CONDITIONS_SWEEP_PAGE_SIZE = 1000;
+const CONDITIONS_SWEEP_MAX_PAGES = 5; // bounds the sweep at 5,000 studies
+
+function rankConditions(tally: Map<string, number>): { condition: string; studies: number }[] {
+  return [...tally.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([condition, studies]) => ({ condition, studies }));
+}
+
+async function ctConditionsSummary(
+  term: string,
+  byRelevance: boolean,
+  filterParams: string[],
+  totalCount: number,
+  firstPageStudies: { conditions: string[] }[],
+): Promise<{ summary: { condition: string; studies: number }[]; coverage: 'complete' | 'partial'; note?: string }> {
+  const tally = new Map<string, number>();
+  const tallyConditions = (conds: string[]) => {
+    for (const raw of conds) {
+      const c = raw.trim();
+      if (c) tally.set(c, (tally.get(c) ?? 0) + 1);
+    }
+  };
+
+  // The page already fetched already holds every match — no extra call needed.
+  if (totalCount <= firstPageStudies.length) {
+    for (const s of firstPageStudies) tallyConditions(s.conditions);
+    return { summary: rankConditions(tally), coverage: 'complete' };
+  }
+
+  let token: string | null = null;
+  let pages = 0;
+  let covered = 0;
+  do {
+    const params = [
+      `query.term=${encodeURIComponent(term)}`,
+      'countTotal=true',
+      `pageSize=${CONDITIONS_SWEEP_PAGE_SIZE}`,
+      `fields=${encodeURIComponent('NCTId,protocolSection.conditionsModule.conditions')}`,
+      ...filterParams,
+      ...(byRelevance ? ['sort=%40relevance'] : []),
+      ...(token ? [`pageToken=${encodeURIComponent(token)}`] : []),
+    ];
+    const res = await pwFetch(`${BASE}?${params.join('&')}`, { headers: { Accept: 'application/json' } });
+    if (!res.ok) await ctError(res);
+    const data = (await boundedJson(res, 'ClinicalTrials.gov conditions sweep', 8_000_000)) as
+      StudiesResponse & { nextPageToken?: string };
+    for (const s of data.studies ?? []) tallyConditions(s.protocolSection?.conditionsModule?.conditions ?? []);
+    covered += data.studies?.length ?? 0;
+    pages += 1;
+    token = data.nextPageToken ?? null;
+  } while (token && pages < CONDITIONS_SWEEP_MAX_PAGES);
+
+  const coverage: 'complete' | 'partial' = token ? 'partial' : 'complete';
+  return {
+    summary: rankConditions(tally),
+    coverage,
+    ...(coverage === 'partial'
+      ? {
+          note: `conditions_summary covers the first ${covered} of ${totalCount} matching studies (capped at ${CONDITIONS_SWEEP_MAX_PAGES * CONDITIONS_SWEEP_PAGE_SIZE}) — it is a partial breakdown, not the complete one. Narrow the query (status/phase/sponsor) to get a complete breakdown.`,
+        }
+      : {}),
+  };
+}
+
 async function ctSearch(
   query: string,
   status?: string,
@@ -1332,6 +1427,7 @@ async function ctSearch(
   sponsor?: string,
   limit?: number,
   sponsorMatchRaw?: unknown,
+  pageToken?: string,
 ) {
   const sponsorMatch = sponsorMatchArg(sponsorMatchRaw);
   if (typeof query !== 'string' || !query.trim()) {
@@ -1351,26 +1447,36 @@ async function ctSearch(
   if (sponsor) advanced.push(sponsorClause(sponsor, sponsorMatch));
   if (phases.length) advanced.push(phaseClause(phases));
 
-  const baseParams: string[] = [`countTotal=true`, `pageSize=${pageSize}`];
-  if (statusCsv) baseParams.push(`filter.overallStatus=${encodeURIComponent(statusCsv)}`);
-  baseParams.push(...advancedParam(advanced));
+  // Split the FILTER params (status/phase/sponsor — identical on every page
+  // and on the conditions sweep) from pageSize/pageToken, which differ per call.
+  const filterParams: string[] = [];
+  if (statusCsv) filterParams.push(`filter.overallStatus=${encodeURIComponent(statusCsv)}`);
+  filterParams.push(...advancedParam(advanced));
 
-  const fetchTerm = async (term: string, byRelevance = false): Promise<StudiesResponse> => {
-    const url = `${BASE}?query.term=${encodeURIComponent(term)}&${baseParams.join('&')}${
+  const fetchTerm = async (
+    term: string,
+    byRelevance = false,
+    pagingParams: string[] = [],
+  ): Promise<StudiesResponse & { nextPageToken?: string }> => {
+    const params = ['countTotal=true', `pageSize=${pageSize}`, ...filterParams, ...pagingParams];
+    const url = `${BASE}?query.term=${encodeURIComponent(term)}&${params.join('&')}${
       byRelevance ? '&sort=%40relevance' : ''
     }`;
     const res = await pwFetch(url);
     if (!res.ok) await ctError(res);
-    return (await res.json()) as StudiesResponse;
+    return (await res.json()) as StudiesResponse & { nextPageToken?: string };
   };
 
+  const trimmedPageToken = typeof pageToken === 'string' ? pageToken.trim() : '';
   let termUsed = parsed.term;
   let matchMode: 'all_terms' | 'any_term' = 'all_terms';
-  let data = await fetchTerm(termUsed);
+  let data = await fetchTerm(termUsed, false, trimmedPageToken ? [`pageToken=${encodeURIComponent(trimmedPageToken)}`] : []);
 
   // Last-resort relaxation. query.term ANDs its tokens, so a multi-word query
-  // can still miss even after framing is stripped. Only fires when we would
-  // otherwise hand back an empty result that reads as "no such trials exist".
+  // can still miss even after framing is stripped. Only fires on a FRESH
+  // search (no page_token) when we would otherwise hand back an empty result
+  // that reads as "no such trials exist" — a page-2+ call reuses whatever term
+  // page 1 already resolved, rather than re-deciding it mid-pagination.
   //
   // Sorted by @relevance, unlike the AND path. An OR over N tokens matches
   // anything containing ANY of them — 150k studies for a three-token cancer
@@ -1385,7 +1491,7 @@ async function ctSearch(
   // some study on the ranked first page actually mentions at least TWO of the
   // asked-for tokens. A page where every hit matched one word is noise, and the
   // honest response to a query about a disease that doesn't exist is zero.
-  if ((data.totalCount ?? 0) === 0 && parsed.tokens.length > 1) {
+  if (!trimmedPageToken && (data.totalCount ?? 0) === 0 && parsed.tokens.length > 1) {
     const orTerm = parsed.tokens.join(' OR ');
     const relaxed = await fetchTerm(orTerm, true);
     if ((relaxed.totalCount ?? 0) > 0 && relaxedIsRelevant(relaxed, parsed.tokens)) {
@@ -1393,6 +1499,38 @@ async function ctSearch(
       termUsed = orTerm;
       matchMode = 'any_term';
     }
+  }
+
+  // ClinicalTrials.gov only returns totalCount on the FIRST page of a query —
+  // verified live: a pageToken follow-up to the identical search omits the
+  // field entirely, not just zero. `data.totalCount ?? 0` would therefore
+  // report total_count: 0 on every page 2+, a clean-looking silent-zero that
+  // reads as "no trials match" on a query that matched 37. Report it as
+  // UNKNOWN (null) with a note instead of fabricating a number the upstream
+  // never sent, on a page-2+ call only — page 1 always has a real count.
+  const totalCount = data.totalCount ?? (trimmedPageToken ? null : 0);
+  const studies = withSponsorMatch((data.studies ?? []).map(formatStudy), sponsor);
+
+  // conditions_summary is computed once, on the FIRST page of a query — a
+  // page-2+ call already has the complete breakdown from that first response
+  // and would otherwise pay for a redundant sweep on every page turned.
+  //
+  // Computed and placed in the result BEFORE `studies` on purpose (fleet
+  // #3191): the first shape of this fix built `result` as a literal with
+  // `studies` already in it, then ADDED conditions_summary via property
+  // assignment afterwards — which puts it last in both insertion order and
+  // the serialized JSON, after every one of the (up to 100) full study
+  // records. Verified live: a real call's structuredContent was 48,466 chars
+  // with conditions_summary starting at char 45,414 — past the 20,000-char
+  // window a truncating or small-context client reads. Aggregates belong
+  // before the bulky array they summarize, in BOTH structuredContent and the
+  // text content a model actually reads, so a caller sees the answer before
+  // it runs out of room.
+  let conditionsSummary: { summary: { condition: string; studies: number }[]; coverage: 'complete' | 'partial'; note?: string } | null = null;
+  if (!trimmedPageToken) {
+    // totalCount is never null here: it only defaults to null in the
+    // trimmedPageToken branch below, and this branch is !trimmedPageToken.
+    conditionsSummary = await ctConditionsSummary(termUsed, matchMode === 'any_term', filterParams, totalCount as number, studies);
   }
 
   return {
@@ -1409,8 +1547,25 @@ async function ctSearch(
       inferred_from_query: !status && parsed.inferredStatus.length > 0
         || !phase && parsed.inferredPhase.length > 0,
     },
-    total_count: data.totalCount ?? 0,
-    studies: withSponsorMatch((data.studies ?? []).map(formatStudy), sponsor),
+    total_count: totalCount,
+    ...(totalCount === null
+      ? { total_count_note: 'ClinicalTrials.gov does not repeat the match total on a page_token follow-up — total_count was already given on the first page of this query.' }
+      : {}),
+    ...(conditionsSummary
+      ? {
+          conditions_coverage: conditionsSummary.coverage,
+          conditions_summary: conditionsSummary.summary,
+          ...(conditionsSummary.note ? { conditions_coverage_note: conditionsSummary.note } : {}),
+        }
+      : {
+          conditions_coverage_note: 'conditions_summary is only computed on the first page of a query (page_token omitted) — see that response for the full breakdown.',
+        }),
+    next_page_token: data.nextPageToken ?? null,
+    next_page_note: data.nextPageToken
+      ? `More studies exist beyond this page — call ct_search again with the SAME query/status/phase/sponsor and page_token:"${data.nextPageToken}" to continue.`
+      : null,
+    // LAST on purpose — see the comment above conditionsSummary.
+    studies,
   };
 }
 
@@ -2475,6 +2630,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         args.sponsor as string | undefined,
         args.limit as number | undefined,
         args.sponsor_match,
+        args.page_token as string | undefined,
       );
     case 'ct_get_study':
       return ctGetStudy(args.nct_id as string);
