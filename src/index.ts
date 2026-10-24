@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -1168,6 +1184,8 @@ const tools: McpToolExport['tools'] = [
         until: { type: 'string', description: 'Optional window end (inclusive), YYYY-MM-DD. Omit for open-ended (up to today).' },
         status: { type: 'string', description: 'Optional overall-status filter (validated; e.g. RECRUITING, or a comma-union like "RECRUITING,COMPLETED").' },
         query: { type: 'string', description: 'Optional search term (condition/drug/keyword) to narrow results.' },
+        sponsor: { type: 'string', description: 'Optional company name (e.g. "Regeneron", "Eli Lilly"). Returns only studies whose registered LEAD sponsor is that company (see sponsor_match), inside the since/until window. Use for a single-company digest.' },
+        sponsor_match: { type: 'string', enum: ['lead', 'lead_or_collaborator'], description: SPONSOR_MATCH_DESCRIPTION },
         limit: { type: 'number', description: 'Number of results per page (1-100, default 20). total_count reports the full window size regardless of limit.' },
       },
     },
@@ -2043,6 +2061,10 @@ async function ctRecentUpdates(args: Record<string, unknown>) {
   const dateRe = /^\d{4}-\d{2}-\d{2}$/;
   if (since && !dateRe.test(since)) throw new Error(`Invalid "since" date "${since}" — use YYYY-MM-DD.`);
   if (until && !dateRe.test(until)) throw new Error(`Invalid "until" date "${until}" — use YYYY-MM-DD.`);
+  // Sponsor filter (fleet #3151, Tapworx): a company digest must not carry other
+  // sponsors' trials. Same lead-sponsor clause every other sponsor tool uses.
+  const sponsorName = typeof args.sponsor === 'string' ? args.sponsor.trim() : '';
+  const sponsorMatch = sponsorMatchArg(args.sponsor_match);
 
   const params: string[] = [
     `sort=${area}:desc`,
@@ -2051,10 +2073,10 @@ async function ctRecentUpdates(args: Record<string, unknown>) {
   ];
   if (query) params.push(`query.term=${encodeURIComponent(query)}`);
   if (status) params.push(...buildFilters(status).params);
-  if (since || until) {
-    const range = `RANGE[${since || 'MIN'},${until || 'MAX'}]`;
-    params.push(...advancedParam([`AREA[${area}]${range}`]));
-  }
+  const advanced: string[] = [];
+  if (since || until) advanced.push(`AREA[${area}]RANGE[${since || 'MIN'},${until || 'MAX'}]`);
+  if (sponsorName) advanced.push(sponsorClause(sponsorName, sponsorMatch));
+  params.push(...advancedParam(advanced));
 
   const res = await pwFetch(`${BASE}?${params.join('&')}`);
   if (!res.ok) await ctError(res);
@@ -2078,9 +2100,12 @@ async function ctRecentUpdates(args: Record<string, unknown>) {
     date_type: dateType,
     sorted_by: `${area} desc`,
     window: { since: since || null, until: until || null },
+    sponsor: sponsorName || null,
+    sponsor_match: sponsorName ? sponsorMatch : null,
     total_count: data.totalCount ?? 0, // studies matching the window — verify your weekly count against this
     returned: studies.length,
-    studies,
+    ...(await sponsorYieldWarning(sponsorName, data.totalCount ?? 0, sponsorMatch)),
+    studies: withSponsorMatch(studies, sponsorName),
   };
 }
 
